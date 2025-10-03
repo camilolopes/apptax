@@ -5,19 +5,16 @@ import io
 import unicodedata
 from typing import List, Tuple
 import chardet
+import re
 
 st.set_page_config(page_title="Pix CSV Uploader (BS2) – Consolidador", page_icon="💳", layout="wide")
 
 # ---------- Utils ----------
 def detect_encoding(b: bytes) -> str:
-    # Try UTF-8 BOM first
     if b.startswith(b"\xef\xbb\xbf"):
         return "utf-8-sig"
-    # Fallback to chardet
     guess = chardet.detect(b)
-    enc = guess.get("encoding") or "utf-8"
-    # Normalize some names
-    enc = enc.lower()
+    enc = (guess.get("encoding") or "utf-8").lower()
     if enc in ("iso-8859-1", "latin-1", "latin1"):
         return "latin1"
     return enc
@@ -30,11 +27,21 @@ def normalize_text(s: str) -> str:
     s = "".join(ch for ch in s if not unicodedata.combining(ch))
     return s.lower().strip()
 
+def clean_val(series: pd.Series) -> pd.Series:
+    s = series.astype(str)
+    s = s.str.replace("\u00A0", "", regex=False)  # NBSP
+    s = s.str.replace("R$", "", regex=False)
+    s = s.str.replace(" ", "", regex=False)
+    s = s.str.replace("\u2212", "-", regex=False)  # unicode minus
+    s = s.str.replace(r"^([0-9\.,]+)-$", r"-\1", regex=True)  # 0,45- -> -0,45
+    s = s.str.replace(".", "", regex=False)  # thousands
+    s = s.str.replace(",", ".", regex=False)  # decimal
+    return pd.to_numeric(s, errors="coerce")
+
 def read_bs2_csv(file_bytes: bytes) -> pd.DataFrame:
     enc = detect_encoding(file_bytes)
     text = file_bytes.decode(enc, errors="replace")
     lines = text.splitlines()
-    # Find header line starting with "Data;"
     header_idx = None
     for i, line in enumerate(lines):
         if line.strip().lower().startswith("data;"):
@@ -45,10 +52,7 @@ def read_bs2_csv(file_bytes: bytes) -> pd.DataFrame:
     sliced = "\n".join(lines[header_idx:])
     from io import StringIO
     df = pd.read_csv(StringIO(sliced), sep=";", dtype=str, keep_default_na=False)
-    # Standardize columns
-    cols = {c: c.strip() for c in df.columns}
-    df = df.rename(columns=cols)
-    # Map to canonical names
+    df = df.rename(columns={c: c.strip() for c in df.columns})
     rename_map = {}
     for col in df.columns:
         c = col.strip().lower()
@@ -65,21 +69,12 @@ def read_bs2_csv(file_bytes: bytes) -> pd.DataFrame:
         elif "observa" in c:
             rename_map[col] = "Observação"
     df = df.rename(columns=rename_map)
-    # Coerce columns existence
     for c in ["Data","Tipo","Detalhe","Identificador","Valor","Observação"]:
         if c not in df.columns:
             df[c] = ""
-    # Parse numeric value (pt-BR)
-    df["Valor"] = (
-        df["Valor"]
-        .astype(str)
-        .str.replace("R$", "", regex=False)
-        .str.replace(".", "", regex=False)
-        .str.replace(",", ".", regex=False)
-    )
-    df["Valor"] = pd.to_numeric(df["Valor"], errors="coerce")
-    # Keep original also
-    return df[["Data","Tipo","Detalhe","Identificador","Valor","Observação"]]
+    df["Valor_raw"] = df["Valor"]
+    df["Valor"] = clean_val(df["Valor"])
+    return df[["Data","Tipo","Detalhe","Identificador","Valor","Observação","Valor_raw"]]
 
 def consolidate(files: List[Tuple[str, bytes]]) -> pd.DataFrame:
     frames = []
@@ -90,7 +85,7 @@ def consolidate(files: List[Tuple[str, bytes]]) -> pd.DataFrame:
             df["Arquivo"] = name
             frames.append(df)
     if not frames:
-        return pd.DataFrame(columns=["Arquivo","Data","Tipo","Detalhe","Identificador","Valor","Observação"])
+        return pd.DataFrame(columns=["Arquivo","Data","Tipo","Detalhe","Identificador","Valor","Observação","Valor_raw"])
     return pd.concat(frames, ignore_index=True)
 
 def filter_and_totals(df: pd.DataFrame):
@@ -177,6 +172,20 @@ if st.session_state["files"]:
         st.metric("Total Tarifa Pix (R$)", f"{total_tarifa:,.2f}")
     with c4:
         st.metric("Total Devolução Pix (R$)", f"{total_devol:,.2f}")
+
+    # Resumo por arquivo
+    st.markdown("### Resumo por arquivo")
+    if not df_all.empty:
+        df_tmp = df_all.copy()
+        df_tmp["Tipo_norm"] = df_tmp["Tipo"].map(normalize_text)
+        resumo_arquivo = df_tmp.groupby("Arquivo").apply(
+            lambda g: pd.Series({
+                "linhas": int(g.shape[0]),
+                "total_tarifa": float(g.loc[g["Tipo_norm"].eq("tarifa operacoes pix"), "Valor"].sum()),
+                "total_devol": float(g.loc[g["Tipo_norm"].eq("devolucao recebida pix"), "Valor"].sum()),
+            })
+        ).reset_index()
+        st.dataframe(resumo_arquivo, use_container_width=True)
 
     with st.expander("Ver prévia de Devoluções"):
         if devol.empty:
